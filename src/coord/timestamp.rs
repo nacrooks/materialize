@@ -346,7 +346,7 @@ fn parse_debezium(record: Vec<(String, Value)>) -> Vec<(String, i64)> {
     let mut result = vec![];
     for (key, value) in record {
         if key == "data_collections" {
-            if let Value::Union(_, value) = value {
+            if let Value::Union(_,value) = value {
                 if let Value::Array(items) = *value {
                     for v in items {
                         if let Value::Record(item) = v {
@@ -388,26 +388,26 @@ fn parse_debezium(record: Vec<(String, Value)>) -> Vec<(String, i64)> {
 /// This function tries to decode to all known formats. If a decoding
 /// is successful, it assumes that all subsequent messages of that stream
 /// will have been encoded using the same formatting/envelope
-fn identify_consistency_format(msgs: &[Vec<u8>]) -> ConsistencyFormatting {
+fn identify_consistency_format(msgs: &Vec<Vec<u8>>) -> ConsistencyFormatting {
     if let Some(msg) = msgs.first() {
         let mut bytes = &msg[5..];
         let res = futures::executor::block_on(avro::from_avro_datum(
             &DEBEZIUM_TRX_SCHEMA_VALUE,
-            &mut bytes,
+            &mut bytes
         ));
-        if res.is_err() {
+        if let Err(_) = res {
             let mut bytes = &msg[5..];
             let res = futures::executor::block_on(avro::from_avro_datum(
                 &DEBEZIUM_TRX_SCHEMA_KEY,
-                &mut bytes,
+                &mut bytes
             ));
-            if res.is_err() {
+            if let Err(_) = res {
                 let bytes = &msg[..];
                 let reader = futures::executor::block_on(Reader::with_schema(
                     &DEBEZIUM_TRX_SCHEMA_VALUE,
                     bytes,
                 ));
-                if reader.is_ok() {
+                if let Ok(_) = reader {
                     ConsistencyFormatting::DebeziumOcf
                 } else {
                     let bytes = &msg[..];
@@ -415,19 +415,18 @@ fn identify_consistency_format(msgs: &[Vec<u8>]) -> ConsistencyFormatting {
                         &DEBEZIUM_TRX_SCHEMA_KEY,
                         bytes,
                     ));
-                    if reader.is_ok() {
+                    if let Ok(_) = reader {
                         ConsistencyFormatting::DebeziumOcf
                     } else {
                         let res = str::from_utf8(msg);
-                        match res {
-                            Err(_) => ConsistencyFormatting::Unknown,
-                            Ok(res) => {
-                                let split: Vec<&str> = res.split(',').collect();
-                                if split.len() == 5 {
-                                    ConsistencyFormatting::Raw
-                                } else {
-                                    ConsistencyFormatting::Unknown
-                                }
+                        if let Err(_) = res {
+                            ConsistencyFormatting::Unknown
+                        } else {
+                            let split: Vec<&str> = res.unwrap().split(',').collect();
+                            if split.len() == 5 {
+                                ConsistencyFormatting::Raw
+                            } else {
+                                ConsistencyFormatting::Unknown
                             }
                         }
                     }
@@ -651,7 +650,7 @@ impl Timestamper {
                         let mut bytes = &msg[5..];
                         let res = futures::executor::block_on(avro::from_avro_datum(
                             &DEBEZIUM_TRX_SCHEMA_VALUE,
-                            &mut bytes,
+                            &mut bytes
                         ));
                         let results = match res {
                             Ok(record) => {
