@@ -7,8 +7,12 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::path::PathBuf;
+use std::fmt::Display;
+use std::error::Error;
 use std::str;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -27,8 +31,13 @@ use rusoto_core::HttpClient;
 use rusoto_credential::StaticProvider;
 use rusoto_kinesis::KinesisClient;
 use rusqlite::{params, NO_PARAMS};
+use tokio::fs::File;
+use tokio_util::codec::{FramedRead, LinesCodec};
+
+use futures::stream::{Stream, StreamExt};
 
 use catalog::sql::SqlVal;
+use dataflow::source::FileReadStyle;
 use dataflow_types::{
     Consistency, ExternalSourceConnector, FileSourceConnector, KafkaSourceConnector,
     KinesisSourceConnector,
@@ -127,7 +136,8 @@ struct RtTimestampConsumer {
 
 enum RtTimestampConnector {
     Kafka(RtKafkaConnector),
-    File(RtFileConnector),
+    File(RtFileConnector<std::vec::Vec<u8>>),
+    Ocf(RtFileConnector<avro::types::Value>),
     Kinesis(RtKinesisConnector),
 }
 
@@ -193,10 +203,22 @@ struct RtKinesisConnector {
 struct ByoKinesisConnector {}
 
 /// Data consumer stub for File source with RT consistency
-struct RtFileConnector {}
+// Natacha: I am trying to use this RtFileConnector for both
+// Avro and LineCodeced files and to "parametrise" it in the enum
+// I had to wrap Error in a box (hence why i had to change the open_file function)
+// I could just create two different file connectors, the problem there is that one
+// of the errors happens to be private, and so I cannot directly put it here
+struct RtFileConnector<T> {
+    file_name: PathBuf,
+    stream: Box<Stream<Item=Result<T,Box<Error>>> + Send>
+    // stream: Box<dyn Stream<Item = Box<dyn Send + 'static>> + Send + 'static>,
+}
 
 /// Data consumer stub for File source with BYO consistency
-struct ByoFileConnector {}
+struct ByoFileConnector {
+    consistency_file_name: PathBuf,
+    stream: Box<dyn Stream<Item = dyn Send + 'static> + Send + 'static>,
+}
 
 fn byo_query_source(consumer: &mut ByoTimestampConsumer, max_increment_size: i64) -> Vec<Vec<u8>> {
     let mut messages = vec![];
@@ -346,7 +368,7 @@ fn parse_debezium(record: Vec<(String, Value)>) -> Vec<(String, i64)> {
     let mut result = vec![];
     for (key, value) in record {
         if key == "data_collections" {
-            if let Value::Union(_,value) = value {
+            if let Value::Union(_, value) = value {
                 if let Value::Array(items) = *value {
                     for v in items {
                         if let Value::Record(item) = v {
@@ -393,13 +415,13 @@ fn identify_consistency_format(msgs: &Vec<Vec<u8>>) -> ConsistencyFormatting {
         let mut bytes = &msg[5..];
         let res = futures::executor::block_on(avro::from_avro_datum(
             &DEBEZIUM_TRX_SCHEMA_VALUE,
-            &mut bytes
+            &mut bytes,
         ));
         if let Err(_) = res {
             let mut bytes = &msg[5..];
             let res = futures::executor::block_on(avro::from_avro_datum(
                 &DEBEZIUM_TRX_SCHEMA_KEY,
-                &mut bytes
+                &mut bytes,
             ));
             if let Err(_) = res {
                 let bytes = &msg[..];
@@ -538,12 +560,16 @@ impl Timestamper {
                                 info!("Timestamping Source {} with Real Time Consistency", id);
                                 let last_offset = self.rt_recover_source(id);
                                 let consumer = self.create_rt_connector(id, sc, last_offset);
-                                self.rt_sources.insert(id, consumer);
+                                if let Some(consumer) = consumer {
+                                    self.rt_sources.insert(id, consumer);
+                                }
                             }
                             Consistency::BringYourOwn(consistency_topic) => {
                                 info!("Timestamping Source {} with BYO Consistency. Consistency Source: {}", id, consistency_topic);
                                 let consumer = self.create_byo_connector(id, sc, consistency_topic);
-                                self.byo_sources.insert(id, consumer);
+                                if let Some(consumer) = consumer {
+                                    self.byo_sources.insert(id, consumer);
+                                }
                             }
                         }
                     }
@@ -650,7 +676,7 @@ impl Timestamper {
                         let mut bytes = &msg[5..];
                         let res = futures::executor::block_on(avro::from_avro_datum(
                             &DEBEZIUM_TRX_SCHEMA_VALUE,
-                            &mut bytes
+                            &mut bytes,
                         ));
                         let results = match res {
                             Ok(record) => {
@@ -705,24 +731,41 @@ impl Timestamper {
         id: SourceInstanceId,
         sc: ExternalSourceConnector,
         last_offset: i64,
-    ) -> RtTimestampConsumer {
+    ) -> Option<RtTimestampConsumer> {
         match sc {
-            ExternalSourceConnector::Kafka(kc) => RtTimestampConsumer {
-                connector: RtTimestampConnector::Kafka(self.create_rt_kafka_connector(id, kc)),
-                last_offset,
-            },
-            ExternalSourceConnector::File(fc) | ExternalSourceConnector::AvroOcf(fc) => {
-                RtTimestampConsumer {
-                    connector: RtTimestampConnector::File(self.create_rt_file_connector(id, fc)),
-                    last_offset,
+            ExternalSourceConnector::Kafka(kc) => {
+                let connector = self.create_rt_kafka_connector(id, kc);
+                match connector {
+                    Some(connector) => Some(RtTimestampConsumer {
+                        connector: RtTimestampConnector::Kafka(connector),
+                        last_offset,
+                    }),
+                    None => None,
                 }
             }
-            ExternalSourceConnector::Kinesis(kinc) => RtTimestampConsumer {
-                connector: RtTimestampConnector::Kinesis(
-                    self.create_rt_kinesis_connector(id, kinc),
-                ),
-                last_offset,
-            },
+            ExternalSourceConnector::File(fc) => {
+                let connector = self.create_rt_file_connector(id, fc);
+                match connector {
+                    Some(connector) => Some(RtTimestampConsumer {
+                        connector: RtTimestampConnector::File(connector),
+                        last_offset,
+                    }),
+                    None => None,
+                }
+            }
+            ExternalSourceConnector::AvroOcf(_fc) => {
+                unimplemented!();
+            }
+            ExternalSourceConnector::Kinesis(kinc) => {
+                let connector = self.create_rt_kinesis_connector(id, kinc);
+                match connector {
+                    Some(connector) => Some(RtTimestampConsumer {
+                        connector: RtTimestampConnector::Kinesis(connector),
+                        last_offset,
+                    }),
+                    None => None,
+                }
+            }
         }
     }
 
@@ -730,7 +773,7 @@ impl Timestamper {
         &self,
         id: SourceInstanceId,
         kc: KafkaSourceConnector,
-    ) -> RtKafkaConnector {
+    ) -> Option<RtKafkaConnector> {
         let mut config = ClientConfig::new();
         config
             .set("auto.offset.reset", "earliest")
@@ -752,27 +795,132 @@ impl Timestamper {
             );
         }
 
-        let k_consumer: BaseConsumer = config.create().expect("Failed to create Kakfa consumer");
-        RtKafkaConnector {
-            consumer: k_consumer,
-            topic: kc.topic,
+        match config.create() {
+            Ok(consumer) => Some(RtKafkaConnector {
+                consumer,
+                topic: kc.topic,
+            }),
+            Err(e) => {
+                error!("Failed to create Kafka Consumer {}", e);
+                None
+            }
         }
+    }
+
+    fn create_rt_ocf_connector<T>  (
+        &self,
+        _id: SourceInstanceId,
+        fc: FileSourceConnector,
+        reader_schema: &Schema,
+    ) -> Option<RtFileConnector<T>> {
+        None
+        /*
+        let file = match futures::executor::block_on(File::open(&fc.path)) {
+            Ok(file) => file,
+            Err(err) => {
+                error!(
+                    "file source: unable to open file at path {}. Error: {}",
+                    fc.path.to_string_lossy(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        let read_style = if fc.tail {
+            FileReadStyle::TailFollowFd
+        } else {
+            FileReadStyle::ReadOnce
+        };
+
+        let ctor = |file| async move {
+            avro::Reader::with_schema(&reader_schema, file)
+                .await
+                .map(|r| r.into_stream())
+        };
+
+
+
+        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file2(
+            file, read_style, ctor,
+        ));
+
+        match stream {
+            Ok(stream) => {
+                Some(RtFileConnector {
+                     stream: Box::new(stream),
+                     file_name: fc.path,
+                })
+            },
+            Err(e) => {
+                error!("Failed to construct stream. Error: {}", e);
+                None
+            }
+        } */
     }
 
     fn create_rt_file_connector(
         &self,
         _id: SourceInstanceId,
-        _fc: FileSourceConnector,
-    ) -> RtFileConnector {
-        error!("Timestamping is unsupported for file sources");
-        RtFileConnector {}
+        fc: FileSourceConnector,
+    ) -> Option<RtFileConnector<std::vec::Vec<u8>>> {
+
+        let file = match futures::executor::block_on(File::open(&fc.path)) {
+            Ok(file) => file,
+            Err(err) => {
+                error!(
+                    "file source: unable to open file at path {}. Error: {}",
+                    fc.path.to_string_lossy(),
+                    err
+                );
+                return None;
+            }
+        };
+
+        let read_style = if fc.tail {
+            FileReadStyle::TailFollowFd
+        } else {
+            FileReadStyle::ReadOnce
+        };
+
+        // Natacha(I tried to modify this to take a box error so that I could
+        // define the type of Result as Error. Given Error doesn't implement Sized
+        // I tried to surround it with a Box)
+        let ctor = |file| {
+            futures::future::ok(
+                FramedRead::new(file, LinesCodec::new()).map(|res|
+                    match res {
+                        Ok(x) => Ok(String::into_bytes(x)),
+                        Err(e) => Err(Box::new(Err(e)))
+                    }
+            ))
+        };
+
+        // Natacha(The original function is open_stream_for_file. But this outputs Result<Out,Err> where
+        // Out is either a std::vec::Vec<u8> or a avro::value::Value.
+        // Err is a (private) line::codec::...::error or an Avro error
+        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file2(file, read_style, ctor,
+        ));
+
+        match stream {
+            Ok(stream) => {
+                Some(RtFileConnector {
+                    stream: Box::new(stream),
+                     file_name: fc.path,
+            })
+        },
+        Err(e) => {
+            //error!("Failed to construct stream. Error: {}", e);
+            None
+        }
+        }
     }
 
     fn create_rt_kinesis_connector(
         &self,
         _id: SourceInstanceId,
         kinc: KinesisSourceConnector,
-    ) -> RtKinesisConnector {
+    ) -> Option<RtKinesisConnector> {
         let provider = StaticProvider::new(
             kinc.access_key.clone(),
             kinc.secret_access_key.clone(),
@@ -782,7 +930,7 @@ impl Timestamper {
         let request_dispatcher = HttpClient::new().unwrap();
         let kinesis_client = KinesisClient::new_with(request_dispatcher, provider, kinc.region);
 
-        RtKinesisConnector { kinesis_client }
+        Some(RtKinesisConnector { kinesis_client })
     }
 
     /// Creates a BYO connector
@@ -791,51 +939,53 @@ impl Timestamper {
         id: SourceInstanceId,
         sc: ExternalSourceConnector,
         timestamp_topic: String,
-    ) -> ByoTimestampConsumer {
+    ) -> Option<ByoTimestampConsumer> {
         match sc {
-            ExternalSourceConnector::Kafka(kc) => ByoTimestampConsumer {
-                source_name: kc.topic.clone(),
-                connector: ByoTimestampConnector::Kafka(self.create_byo_kafka_connector(
-                    id,
-                    kc,
-                    timestamp_topic,
-                )),
-                envelope: ConsistencyFormatting::Unknown,
-                last_partition_ts: HashMap::new(),
-                last_ts: 0,
-                current_partition_count: 0,
-                last_offset: 0,
-            },
-            ExternalSourceConnector::File(fc) | ExternalSourceConnector::AvroOcf(fc) => {
-                error!("File sources are unsupported for timestamping");
-                ByoTimestampConsumer {
-                    source_name: String::from(""),
-                    connector: ByoTimestampConnector::File(self.create_byo_file_connector(
-                        id,
-                        fc,
-                        timestamp_topic,
-                    )),
-                    envelope: ConsistencyFormatting::Unknown,
-                    last_partition_ts: HashMap::new(),
-                    last_ts: 0,
-                    current_partition_count: 0,
-                    last_offset: 0,
+            ExternalSourceConnector::Kafka(kc) => {
+                let topic = kc.topic.clone();
+                match self.create_byo_kafka_connector(id, kc, timestamp_topic) {
+                    Some(connector) => Some(ByoTimestampConsumer {
+                        source_name: topic,
+                        connector: ByoTimestampConnector::Kafka(connector),
+                        envelope: ConsistencyFormatting::Unknown,
+                        last_partition_ts: HashMap::new(),
+                        last_ts: 0,
+                        current_partition_count: 0,
+                        last_offset: 0,
+                    }),
+                    None => None,
                 }
+            }
+            ExternalSourceConnector::File(fc) => {
+                match self.create_byo_file_connector(id, fc, timestamp_topic) {
+                    Some(consumer) => Some(ByoTimestampConsumer {
+                        source_name: String::from(""),
+                        connector: ByoTimestampConnector::File(consumer),
+                        envelope: ConsistencyFormatting::Unknown,
+                        last_partition_ts: HashMap::new(),
+                        last_ts: 0,
+                        current_partition_count: 0,
+                        last_offset: 0,
+                    }),
+                    None => None,
+                }
+            }
+            ExternalSourceConnector::AvroOcf(fc) => {
+                unimplemented!();
             }
             ExternalSourceConnector::Kinesis(kinc) => {
                 error!("Kinesis sources are unsupported for timestamping");
-                ByoTimestampConsumer {
-                    source_name: String::from(""),
-                    connector: ByoTimestampConnector::Kinesis(self.create_byo_kinesis_connector(
-                        id,
-                        kinc,
-                        timestamp_topic,
-                    )),
-                    envelope: ConsistencyFormatting::Unknown,
-                    last_partition_ts: HashMap::new(),
-                    last_ts: 0,
-                    current_partition_count: 0,
-                    last_offset: 0,
+                match self.create_byo_kinesis_connector(id, kinc, timestamp_topic) {
+                    Some(consumer) => Some(ByoTimestampConsumer {
+                        source_name: String::from(""),
+                        connector: ByoTimestampConnector::Kinesis(consumer),
+                        envelope: ConsistencyFormatting::Unknown,
+                        last_partition_ts: HashMap::new(),
+                        last_ts: 0,
+                        current_partition_count: 0,
+                        last_offset: 0,
+                    }),
+                    None => None,
                 }
             }
         }
@@ -846,8 +996,8 @@ impl Timestamper {
         _id: SourceInstanceId,
         _fc: FileSourceConnector,
         _timestamp_topic: String,
-    ) -> ByoFileConnector {
-        ByoFileConnector {}
+    ) -> Option<ByoFileConnector> {
+        unimplemented!();
     }
 
     fn create_byo_kinesis_connector(
@@ -855,8 +1005,8 @@ impl Timestamper {
         _id: SourceInstanceId,
         _kinc: KinesisSourceConnector,
         _timestamp_topic: String,
-    ) -> ByoKinesisConnector {
-        ByoKinesisConnector {}
+    ) -> Option<ByoKinesisConnector> {
+        unimplemented!();
     }
 
     fn create_byo_kafka_connector(
@@ -864,7 +1014,7 @@ impl Timestamper {
         id: SourceInstanceId,
         kc: KafkaSourceConnector,
         timestamp_topic: String,
-    ) -> ByoKafkaConnector {
+    ) -> Option<ByoKafkaConnector> {
         let mut config = ClientConfig::new();
         config
             .set(
@@ -889,24 +1039,32 @@ impl Timestamper {
             );
         }
 
-        let k_consumer: BaseConsumer = config.create().expect("Failed to create Kakfa consumer");
-        let consumer = ByoKafkaConnector {
-            consumer: k_consumer,
-            timestamp_topic,
-        };
-        consumer
-            .consumer
-            .subscribe(&[&consumer.timestamp_topic])
-            .unwrap();
+        match config.create() {
+            Ok(consumer) => {
+                let consumer = ByoKafkaConnector {
+                    consumer,
+                    timestamp_topic,
+                };
+                consumer
+                    .consumer
+                    .subscribe(&[&consumer.timestamp_topic])
+                    .unwrap();
 
-        let partitions = get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic);
-        if partitions.len() != 1 {
-            error!(
-                "Consistency topic should contain a single partition. Contains {}",
-                partitions.len()
-            );
+                let partitions =
+                    get_kafka_partitions(&consumer.consumer, &consumer.timestamp_topic);
+                if partitions.len() != 1 {
+                    error!(
+                        "Consistency topic should contain a single partition. Contains {}",
+                        partitions.len()
+                    );
+                }
+                Some(consumer)
+            }
+            Err(e) => {
+                error!("Could not create a Kafka consumer. Error: {}", e);
+                None
+            }
         }
-        consumer
     }
 
     /// Recovers any existing timestamp updates for that (SourceId,ViewId) pair from the underlying

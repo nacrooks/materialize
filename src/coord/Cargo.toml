@@ -41,4 +41,5 @@ sql-parser = { path = "../sql-parser" }
 symbiosis = { path = "../symbiosis" }
 timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", features = ["bincode"] }
 tokio = "0.2"
+tokio-util = { version = "0.3", features = ["codec"] }
 url = "2"

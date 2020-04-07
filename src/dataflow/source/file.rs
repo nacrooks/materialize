@@ -126,42 +126,19 @@ async fn send_records<S, Out, Err>(
     }
 }
 
-async fn read_file_task<Ctor, S, Out, Err, Fut>(
-    path: PathBuf,
-    tx: futures::channel::mpsc::Sender<Out>,
-    activator: Arc<Mutex<SyncActivator>>,
+pub async fn open_stream_from_file2<Ctor, S, Out, Err, Fut>(
+    file: tokio::fs::File,
     read_style: FileReadStyle,
     stream_ctor: Ctor,
-) where
-    S: Stream<Item = Result<Out, Err>> + Unpin,
-    Ctor: FnOnce(Box<dyn AsyncRead + Unpin + Send>) -> Fut,
-    Err: Display,
-    Fut: Future<Output = Result<S, Err>>,
+) -> Result<S, Err>
+    where
+        S: Stream<Item = Result<Out, Box<Err>>> + Unpin + Send,
+        Ctor: FnOnce(Box<dyn AsyncRead + Unpin + Send>) -> Fut,
+        Fut: Future<Output = Result<S, Err>>,
 {
-    let file = match File::open(&path).await {
-        Ok(file) => file,
-        Err(err) => {
-            error!(
-                "file source: unable to open file at path {}. Error: {}",
-                path.to_string_lossy(),
-                err
-            );
-            return;
-        }
-    };
-
     match read_style {
         FileReadStyle::None => unreachable!(),
-        FileReadStyle::ReadOnce => {
-            let stream = match stream_ctor(Box::new(file)).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    error!("Failed to create read-once source: {}", err);
-                    return;
-                }
-            };
-            send_records(stream, tx, activator).await
-        }
+        FileReadStyle::ReadOnce => stream_ctor(Box::new(file)).await,
         FileReadStyle::TailFollowFd => {
             // FSEvents doesn't raise events until you close the file, making it
             // useless for tailing log files that are kept open by the daemon
@@ -177,13 +154,13 @@ async fn read_file_task<Ctor, S, Out, Err, Fut>(
             //
             // https://github.com/notify-rs/notify/issues/240
             #[cfg(target_os = "macos")]
-            let (file_events_stream, watcher) = {
+                let (file_events_stream, watcher) = {
                 let interval = tokio::time::interval(Duration::from_millis(100));
                 (interval, None)
             };
 
             #[cfg(not(target_os = "macos"))]
-            let (file_events_stream, watcher) = {
+                let (file_events_stream, watcher) = {
                 let (notice_tx, notice_rx) = std::sync::mpsc::channel();
                 let mut w = match notify::RecommendedWatcher::new_raw(notice_tx) {
                     Ok(w) => w,
@@ -213,16 +190,116 @@ async fn read_file_task<Ctor, S, Out, Err, Fut>(
                 _w: watcher,
             };
 
-            let stream = match stream_ctor(Box::new(file)).await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    error!("Failed to create tailed file source: {}", err);
-                    return;
-                }
-            };
-            send_records(stream, tx, activator).await
+            stream_ctor(Box::new(file)).await
         }
     }
+}
+
+pub async fn open_stream_from_file<Ctor, S, Out, Err, Fut>(
+    file: tokio::fs::File,
+    read_style: FileReadStyle,
+    stream_ctor: Ctor,
+) -> Result<S, Err>
+    where
+        S: Stream<Item = Result<Out, Err>> + Unpin + Send,
+        Ctor: FnOnce(Box<dyn AsyncRead + Unpin + Send>) -> Fut,
+        Err: Display,
+        Fut: Future<Output = Result<S, Err>>,
+{
+    match read_style {
+        FileReadStyle::None => unreachable!(),
+        FileReadStyle::ReadOnce => stream_ctor(Box::new(file)).await,
+        FileReadStyle::TailFollowFd => {
+            // FSEvents doesn't raise events until you close the file, making it
+            // useless for tailing log files that are kept open by the daemon
+            // writing to them.
+            //
+            // Avoid this issue by just waking up and polling the file on macOS
+            // every 100ms. We don't want to use notify::PollWatcher, since that
+            // occasionally misses updates if the file is changed twice within
+            // one second (it uses an mtime granularity of 1s). Plus it's not
+            // actually more efficient; our call to poll_read will be as fast as
+            // the PollWatcher's call to stat, and it actually saves a syscall
+            // if the file has data available.
+            //
+            // https://github.com/notify-rs/notify/issues/240
+            #[cfg(target_os = "macos")]
+                let (file_events_stream, watcher) = {
+                let interval = tokio::time::interval(Duration::from_millis(100));
+                (interval, None)
+            };
+
+            #[cfg(not(target_os = "macos"))]
+                let (file_events_stream, watcher) = {
+                let (notice_tx, notice_rx) = std::sync::mpsc::channel();
+                let mut w = match notify::RecommendedWatcher::new_raw(notice_tx) {
+                    Ok(w) => w,
+                    Err(err) => {
+                        error!("file source: failed to create notify watcher: {}", err);
+                        return;
+                    }
+                };
+                if let Err(err) = w.watch(&path, RecursiveMode::NonRecursive) {
+                    error!("file source: failed to add watch: {}", err);
+                    return;
+                }
+                let (async_tx, async_rx) = futures::channel::mpsc::unbounded();
+                task::spawn_blocking(move || {
+                    for msg in notice_rx {
+                        if async_tx.unbounded_send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+                (async_rx, Some(w))
+            };
+
+            let file = ForeverTailedAsyncFile {
+                rx: file_events_stream.fuse(),
+                inner: file,
+                _w: watcher,
+            };
+
+            stream_ctor(Box::new(file)).await
+        }
+    }
+}
+
+
+
+async fn read_file_task<Ctor, S, Out, Err, Fut>(
+    path: PathBuf,
+    tx: futures::channel::mpsc::Sender<Out>,
+    activator: Arc<Mutex<SyncActivator>>,
+    read_style: FileReadStyle,
+    stream_ctor: Ctor,
+) where
+    S: Stream<Item = Result<Out, Err>> + Unpin + Send,
+    Ctor: FnOnce(Box<dyn AsyncRead + Unpin + Send>) -> Fut,
+    Err: Display,
+    Fut: Future<Output = Result<S, Err>>,
+{
+    let file = match File::open(&path).await {
+        Ok(file) => file,
+        Err(err) => {
+            error!(
+                "file source: unable to open file at path {}. Error: {}",
+                path.to_string_lossy(),
+                err
+            );
+            return;
+        }
+    };
+
+    let stream = open_stream_from_file(file, read_style, stream_ctor).await;
+
+    match stream {
+        Ok(stream) => send_records(stream, tx, activator).await,
+        Err(err) => {
+            error!("file source: unable to construct stream. Error {}", err);
+            return;
+        }
+    };
 }
 
 pub fn file<G, Ctor, S, Out, Err, Fut>(
