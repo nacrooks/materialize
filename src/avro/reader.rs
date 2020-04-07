@@ -275,6 +275,15 @@ impl<R: AsyncRead + Unpin + Send> Reader<R> {
             Ok(r.read_next().await?.map(|v| (v, r)))
         }))
     }
+
+    pub fn into_stream_strerr(self) -> impl Stream<Item = Result<Value, String>> + Unpin {
+        Box::pin(try_unfold(self, |mut r| async {
+            Ok(match r.read_next().await {
+                Ok(val) => val.map(|v| (v, r)),
+                Err(e) => return Err(e.to_string()),
+            })
+        }))
+    }
 }
 
 pub struct SchemaResolver<'a> {

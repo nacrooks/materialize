@@ -7,12 +7,14 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::borrow::Borrow;
+use std::borrow::BorrowMut;
 use std::boxed::Box;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::path::PathBuf;
-use std::fmt::Display;
 use std::error::Error;
+use std::fmt::Display;
+use std::path::PathBuf;
 use std::str;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -136,9 +138,16 @@ struct RtTimestampConsumer {
 
 enum RtTimestampConnector {
     Kafka(RtKafkaConnector),
-    File(RtFileConnector<std::vec::Vec<u8>>),
-    Ocf(RtFileConnector<avro::types::Value>),
+    File(RtFileConnector<std::vec::Vec<u8>, String>),
+    Ocf(RtFileConnector<avro::types::Value, String>),
     Kinesis(RtKinesisConnector),
+}
+
+enum ByoTimestampConnector {
+    Kafka(ByoKafkaConnector),
+    File(ByoFileConnector<std::vec::Vec<u8>, String>),
+    Ocf(ByoFileConnector<avro::types::Value, String>),
+    Kinesis(ByoKinesisConnector),
 }
 
 /// Timestamp consumer: wrapper around source consumers that stores necessary information
@@ -175,11 +184,6 @@ enum ConsistencyFormatting {
     // Debezium format (OCF + Avro)
     DebeziumOcf,
 }
-enum ByoTimestampConnector {
-    Kafka(ByoKafkaConnector),
-    File(ByoFileConnector),
-    Kinesis(ByoKinesisConnector),
-}
 
 /// Data consumer for Kafka source with RT consistency
 struct RtKafkaConnector {
@@ -208,16 +212,13 @@ struct ByoKinesisConnector {}
 // I had to wrap Error in a box (hence why i had to change the open_file function)
 // I could just create two different file connectors, the problem there is that one
 // of the errors happens to be private, and so I cannot directly put it here
-struct RtFileConnector<T> {
-    file_name: PathBuf,
-    stream: Box<Stream<Item=Result<T,Box<Error>>> + Send>
-    // stream: Box<dyn Stream<Item = Box<dyn Send + 'static>> + Send + 'static>,
+struct RtFileConnector<Out, Err> {
+    stream: Box<dyn Stream<Item = Result<Out, Err>> + Send + Unpin>,
 }
 
 /// Data consumer stub for File source with BYO consistency
-struct ByoFileConnector {
-    consistency_file_name: PathBuf,
-    stream: Box<dyn Stream<Item = dyn Send + 'static> + Send + 'static>,
+struct ByoFileConnector<Out, Err> {
+    stream: Box<dyn Stream<Item = Result<Out, Err>> + Send + Unpin>,
 }
 
 fn byo_query_source(consumer: &mut ByoTimestampConsumer, max_increment_size: i64) -> Vec<Vec<u8>> {
@@ -238,11 +239,40 @@ fn byo_query_source(consumer: &mut ByoTimestampConsumer, max_increment_size: i64
         ByoTimestampConnector::Kinesis(_kinesis_consumer) => {
             error!("Timestamping for Kinesis sources is unimplemented");
         }
-        ByoTimestampConnector::File(_file_consumer) => {
-            error!("Timestamping for File sources is unimplemented");
+        ByoTimestampConnector::File(file_consumer) => {
+            while let Some(payload) =
+                futures::executor::block_on(file_get_next_message((file_consumer)))
+            {
+                messages.push(payload);
+                msg_count += 1;
+                if msg_count == max_increment_size {
+                    // Make sure to bound the number of timestamp updates we have at once,
+                    // to avoid overflowing the system
+                    break;
+                }
+            }
+        }
+        ByoTimestampConnector::Ocf(file_consumer) => {
+            unimplemented!();
         }
     }
     messages
+}
+
+/// Returns the next message of a stream, or None if no such message exists
+async fn file_get_next_message<Out, Err>(
+    file_consumer: &mut ByoFileConnector<Out, Err>,
+) -> Option<Out>
+where
+    Err: Display,
+{
+     file_consumer.stream.next().await.map(|rec| match rec {
+        Ok(rec) => Some(rec),
+        Err(e) => {
+            error!("Could not read from stream {}", e.to_string());
+            None
+        }
+    }).flatten()
 }
 
 fn byo_extract_ts_update(
@@ -461,6 +491,21 @@ fn identify_consistency_format(msgs: &Vec<Vec<u8>>) -> ConsistencyFormatting {
         }
     } else {
         ConsistencyFormatting::Unknown
+    }
+}
+
+/// This function determines the next maximum offset to timestamp.
+/// This offset should be no greater than max_increment_size
+fn determine_next_offset(
+    cons: &RtTimestampConsumer,
+    available_offsets: i64,
+    max_increment_size: i64,
+) -> i64 {
+    // Bound the next timestamp to be no more than max_increment_size in the future
+    if (available_offsets - cons.last_offset) > max_increment_size {
+        cons.last_offset + max_increment_size
+    } else {
+        available_offsets
     }
 }
 
@@ -807,15 +852,13 @@ impl Timestamper {
         }
     }
 
-    fn create_rt_ocf_connector<T>  (
+    fn create_rt_ocf_connector(
         &self,
         _id: SourceInstanceId,
         fc: FileSourceConnector,
         reader_schema: &Schema,
-    ) -> Option<RtFileConnector<T>> {
-        None
-        /*
-        let file = match futures::executor::block_on(File::open(&fc.path)) {
+    ) -> Option<RtFileConnector<avro::types::Value, String>> {
+        /* let file = match futures::executor::block_on(File::open(&fc.path)) {
             Ok(file) => file,
             Err(err) => {
                 error!(
@@ -836,35 +879,30 @@ impl Timestamper {
         let ctor = |file| async move {
             avro::Reader::with_schema(&reader_schema, file)
                 .await
-                .map(|r| r.into_stream())
+                .map(|r| r.into_stream_strerr())
         };
 
-
-
-        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file2(
+        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file(
             file, read_style, ctor,
         ));
 
         match stream {
-            Ok(stream) => {
-                Some(RtFileConnector {
-                     stream: Box::new(stream),
-                     file_name: fc.path,
-                })
-            },
+            Ok(stream) => Some(RtFileConnector {
+                stream: Box::new(stream),
+            }),
             Err(e) => {
                 error!("Failed to construct stream. Error: {}", e);
                 None
             }
         } */
+        None
     }
 
     fn create_rt_file_connector(
         &self,
         _id: SourceInstanceId,
         fc: FileSourceConnector,
-    ) -> Option<RtFileConnector<std::vec::Vec<u8>>> {
-
+    ) -> Option<RtFileConnector<std::vec::Vec<u8>, String>> {
         let file = match futures::executor::block_on(File::open(&fc.path)) {
             Ok(file) => file,
             Err(err) => {
@@ -883,36 +921,27 @@ impl Timestamper {
             FileReadStyle::ReadOnce
         };
 
-        // Natacha(I tried to modify this to take a box error so that I could
-        // define the type of Result as Error. Given Error doesn't implement Sized
-        // I tried to surround it with a Box)
         let ctor = |file| {
             futures::future::ok(
-                FramedRead::new(file, LinesCodec::new()).map(|res|
-                    match res {
-                        Ok(x) => Ok(String::into_bytes(x)),
-                        Err(e) => Err(Box::new(Err(e)))
-                    }
-            ))
+                FramedRead::new(file, LinesCodec::new()).map(|res| match res {
+                    Ok(x) => Ok(String::into_bytes(x)),
+                    Err(e) => Err(e.to_string()),
+                }),
+            )
         };
 
-        // Natacha(The original function is open_stream_for_file. But this outputs Result<Out,Err> where
-        // Out is either a std::vec::Vec<u8> or a avro::value::Value.
-        // Err is a (private) line::codec::...::error or an Avro error
-        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file2(file, read_style, ctor,
+        let stream = futures::executor::block_on(dataflow::source::open_stream_from_file(
+            file, read_style, ctor,
         ));
 
         match stream {
-            Ok(stream) => {
-                Some(RtFileConnector {
-                    stream: Box::new(stream),
-                     file_name: fc.path,
-            })
-        },
-        Err(e) => {
-            //error!("Failed to construct stream. Error: {}", e);
-            None
-        }
+            Ok(stream) => Some(RtFileConnector {
+                stream: Box::new(stream),
+            }),
+            Err(e) => {
+                error!("Failed to construct stream. Error: {}", e);
+                None
+            }
         }
     }
 
@@ -971,7 +1000,18 @@ impl Timestamper {
                 }
             }
             ExternalSourceConnector::AvroOcf(fc) => {
-                unimplemented!();
+                match self.create_byo_ocf_connector(id, fc, timestamp_topic) {
+                    Some(consumer) => Some(ByoTimestampConsumer {
+                        source_name: String::from(""),
+                        connector: ByoTimestampConnector::Ocf(consumer),
+                        envelope: ConsistencyFormatting::Unknown,
+                        last_partition_ts: HashMap::new(),
+                        last_ts: 0,
+                        current_partition_count: 0,
+                        last_offset: 0,
+                    }),
+                    None => None,
+                }
             }
             ExternalSourceConnector::Kinesis(kinc) => {
                 error!("Kinesis sources are unsupported for timestamping");
@@ -996,7 +1036,16 @@ impl Timestamper {
         _id: SourceInstanceId,
         _fc: FileSourceConnector,
         _timestamp_topic: String,
-    ) -> Option<ByoFileConnector> {
+    ) -> Option<ByoFileConnector<std::vec::Vec<u8>, String>> {
+        unimplemented!();
+    }
+
+    fn create_byo_ocf_connector(
+        &self,
+        _id: SourceInstanceId,
+        _fc: FileSourceConnector,
+        _timestamp_topic: String,
+    ) -> Option<ByoFileConnector<avro::types::Value, String>> {
         unimplemented!();
     }
 
@@ -1124,15 +1173,10 @@ impl Timestamper {
                         match watermark {
                             Ok(watermark) => {
                                 let high = watermark.1;
-                                // Bound the next timestamp to be no more than max_increment_size in the future
-                                let next_ts = if (high - cons.last_offset) > self.max_increment_size
-                                {
-                                    cons.last_offset + self.max_increment_size
-                                } else {
-                                    high
-                                };
-                                cons.last_offset = next_ts;
-                                result.push((*id, partition_count, p, next_ts))
+                                let next_offset =
+                                    determine_next_offset(cons, high, self.max_increment_size);
+                                cons.last_offset = next_offset;
+                                result.push((*id, partition_count, p, next_offset))
                             }
                             Err(e) => {
                                 error!(
@@ -1143,8 +1187,27 @@ impl Timestamper {
                         }
                     }
                 }
-                RtTimestampConnector::File(_cons) => {
-                    error!("Timestamping for File sources is not supported");
+                RtTimestampConnector::File(fc) => {
+                    // Warning: size_hint(). is not enforced that a stream implementation yields
+                    // the declared number of elements. A buggy stream may yield less than the
+                    // lower bound or more than the upper bound of elements.
+                    //TODO(natacha) fix conversion
+                    let high = fc.stream.size_hint().0 as i64;
+                    println!("Stream Bound {}", high);
+                    let next_offset = determine_next_offset(cons, high, self.max_increment_size);
+                    cons.last_offset = next_offset;
+                    // There is no notion of a partition in a file
+                    result.push((*id, 1, 0, next_offset))
+                }
+                RtTimestampConnector::Ocf(fc) => {
+                    // Warning: size_hint(). is not enforced that a stream implementation yields
+                    // the declared number of elements. A buggy stream may yield less than the
+                    // lower bound or more than the upper bound of elements.
+                    let high = fc.stream.size_hint().0 as i64;
+                    println!("Stream Bound {}", high);
+                    let next_offset = determine_next_offset(cons, high, self.max_increment_size);
+                    cons.last_offset = next_offset;
+                    result.push((*id, 1, 0, next_offset))
                 }
                 RtTimestampConnector::Kinesis(_kc) => {
                     // For now, always just push the current system timestamp.
