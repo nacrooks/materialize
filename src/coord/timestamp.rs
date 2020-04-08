@@ -36,7 +36,7 @@ use rusqlite::{params, NO_PARAMS};
 use tokio::fs::File;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use futures::stream::{Stream, StreamExt};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 
 use catalog::sql::SqlVal;
 use dataflow::source::FileReadStyle;
@@ -45,6 +45,7 @@ use dataflow_types::{
     KinesisSourceConnector,
 };
 use expr::SourceInstanceId;
+
 
 use crate::coord;
 
@@ -858,7 +859,7 @@ impl Timestamper {
         fc: FileSourceConnector,
         reader_schema: &Schema,
     ) -> Option<RtFileConnector<avro::types::Value, String>> {
-        /* let file = match futures::executor::block_on(File::open(&fc.path)) {
+         let file = match futures::executor::block_on(File::open(&fc.path)) {
             Ok(file) => file,
             Err(err) => {
                 error!(
@@ -877,9 +878,13 @@ impl Timestamper {
         };
 
         let ctor = |file| async move {
-            avro::Reader::with_schema(&reader_schema, file)
-                .await
-                .map(|r| r.into_stream_strerr())
+            match avro::Reader::with_schema(&reader_schema, file)
+                .await {
+                Ok(res) => {
+                    Ok(res.into_stream().map_err(|e| e.to_string()))
+                },
+                Err(e) => Err(e.to_string())
+            }
         };
 
         let stream = futures::executor::block_on(dataflow::source::open_stream_from_file(
@@ -894,8 +899,7 @@ impl Timestamper {
                 error!("Failed to construct stream. Error: {}", e);
                 None
             }
-        } */
-        None
+        }
     }
 
     fn create_rt_file_connector(
