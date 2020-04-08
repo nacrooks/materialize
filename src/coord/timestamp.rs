@@ -575,7 +575,7 @@ impl Timestamper {
                         envelope,
                         consistency
                     } = sc {
-                        (connector,encoding,envelope,cons)
+                        (connector,encoding,envelope,consistency)
                     } else {
                         panic!("A Local Source should never be timestamped");
                     };
@@ -585,14 +585,14 @@ impl Timestamper {
                             Consistency::RealTime => {
                                 info!("Timestamping Source {} with Real Time Consistency", id);
                                 let last_offset = self.rt_recover_source(id);
-                                let consumer = self.create_rt_connector(id, sc, env,last_offset);
+                                let consumer = self.create_rt_connector(id, sc, enc,last_offset);
                                 if let Some(consumer) = consumer {
                                     self.rt_sources.insert(id, consumer);
                                 }
                             }
                             Consistency::BringYourOwn(consistency_topic) => {
                                 info!("Timestamping Source {} with BYO Consistency. Consistency Source: {}", id, consistency_topic);
-                                let consumer = self.create_byo_connector(id, sc, env, consistency_topic);
+                                let consumer = self.create_byo_connector(id, sc, enc, consistency_topic);
                                 if let Some(consumer) = consumer {
                                     self.byo_sources.insert(id, consumer);
                                 }
@@ -768,7 +768,7 @@ impl Timestamper {
         &self,
         id: SourceInstanceId,
         sc: ExternalSourceConnector,
-        encoding: Encoding,
+        encoding: DataEncoding,
         last_offset: i64,
     ) -> Option<RtTimestampConsumer> {
 
@@ -974,7 +974,7 @@ impl Timestamper {
         &self,
         id: SourceInstanceId,
         sc: ExternalSourceConnector,
-        encoding: Encoding,
+        encoding: DataEncoding,
         timestamp_topic: String,
     ) -> Option<ByoTimestampConsumer> {
         match sc {
