@@ -117,6 +117,16 @@ impl fmt::Display for SourceInstanceId {
     }
 }
 
+/// Unique identifier for each part of a whole source.
+///     Kafka -> partition
+///     Kinesis -> shard
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum PartitionId {
+    Kafka(i32),
+    Kinesis(String),
+    File
+}
+
 /// Humanizer that provides no additional information.
 #[derive(Debug)]
 pub struct DummyHumanizer;

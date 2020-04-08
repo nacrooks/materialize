@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -36,12 +37,13 @@ use dataflow::logging::materialized::MaterializedEvent;
 use dataflow::{SequencedCommand, WorkerFeedback, WorkerFeedbackWithMeta};
 use dataflow_types::logging::LoggingConfig;
 use dataflow_types::{
-    DataflowDesc, IndexDesc, KafkaSinkConnector, PeekResponse, PeekWhen, SinkConnector,
-    TailSinkConnector, Timestamp, Update,
+    AvroOcfSinkConnector, DataflowDesc, IndexDesc, KafkaSinkConnector, PeekResponse, PeekWhen,
+    SinkConnector, TailSinkConnector, Timestamp, Update,
 };
 use expr::transform::Optimizer;
 use expr::{
-    EvalEnv, GlobalId, Id, IdHumanizer, RelationExpr, RowSetFinishing, ScalarExpr, SourceInstanceId,
+    EvalEnv, GlobalId, Id, IdHumanizer, PartitionId, RelationExpr, RowSetFinishing, ScalarExpr,
+    SourceInstanceId,
 };
 use ore::collections::CollectionExt;
 use ore::thread::JoinHandleExt;
@@ -60,7 +62,7 @@ pub enum Message {
     AdvanceSourceTimestamp {
         id: SourceInstanceId,
         partition_count: i32,
-        pid: i32,
+        pid: PartitionId,
         timestamp: u64,
         offset: i64,
     },
@@ -452,9 +454,17 @@ where
                     worker_id: _,
                     message: WorkerFeedback::CreateSource(source_id, sc, consistency),
                 }) => {
-                    ts_tx
-                        .send(TimestampMessage::Add(source_id, sc, consistency))
-                        .expect("Failed to send CREATE Instance notice to timestamper");
+                    if let Some(entry) = self.catalog.try_get_by_id(source_id.sid) {
+                        if let CatalogItem::Source(s) =  entry.item() {
+                            ts_tx
+                                .send(TimestampMessage::Add(source_id, s.connector, consistency))
+                                .expect("Failed to send CREATE Instance notice to timestamper");
+                        } else {
+                            panic!("A non-source is re-using the same source ID");
+                        }
+                    } else {
+                        // Someone already dropped the source
+                    }
                 }
 
                 Message::AdvanceSourceTimestamp {
@@ -1210,14 +1220,20 @@ where
         conn_id: u32,
         source_id: GlobalId,
     ) -> Result<ExecuteResponse, failure::Error> {
-        let index_id = if let Some(Some((index_id, _))) = self
+        // Determine the frontier of updates to tail *from*.
+        // Updates greater or equal to this frontier will be produced.
+        let since = if let Some(Some((index_id, _))) = self
             .views
             .get(&source_id)
             .map(|view_state| &view_state.default_idx)
         {
-            index_id
+            self.upper_of(index_id)
+                .expect("name missing at coordinator")
+                .get(0)
+                .copied()
+                .unwrap_or(Timestamp::max_value())
         } else {
-            bail!("Cannot tail a view that has not been materialized.")
+            0 as Timestamp
         };
 
         let sink_name = format!(
@@ -1229,12 +1245,6 @@ where
         let sink_id = self.catalog.allocate_id()?;
         self.active_tails.insert(conn_id, sink_id);
         let (tx, rx) = self.switchboard.mpsc_limited(self.num_timely_workers);
-        let since = self
-            .upper_of(index_id)
-            .expect("name missing at coordinator")
-            .get(0)
-            .copied()
-            .unwrap_or(Timestamp::max_value());
         self.create_sink_dataflow(
             sink_name,
             sink_id,
@@ -1411,7 +1421,6 @@ where
                             ..
                         }) => {
                             sinks_to_drop.push(entry.id());
-                            #[allow(clippy::single_match)]
                             match connector {
                                 SinkConnector::Kafka(KafkaSinkConnector { topic, .. }) => {
                                     broadcast(
@@ -1421,6 +1430,18 @@ where
                                             topic: topic.clone(),
                                             insert: false,
                                         }),
+                                    );
+                                }
+                                SinkConnector::AvroOcf(AvroOcfSinkConnector { path }) => {
+                                    broadcast(
+                                        &mut self.broadcast_tx,
+                                        SequencedCommand::AppendLog(
+                                            MaterializedEvent::AvroOcfSink {
+                                                id: entry.id(),
+                                                path: path.clone().into_os_string().into_vec(),
+                                                insert: false,
+                                            },
+                                        ),
                                     );
                                 }
                                 _ => (),
@@ -1649,6 +1670,16 @@ where
                     SequencedCommand::AppendLog(MaterializedEvent::KafkaSink {
                         id,
                         topic: topic.clone(),
+                        insert: true,
+                    }),
+                );
+            }
+            SinkConnector::AvroOcf(AvroOcfSinkConnector { path }) => {
+                broadcast(
+                    &mut self.broadcast_tx,
+                    SequencedCommand::AppendLog(MaterializedEvent::AvroOcfSink {
+                        id,
+                        path: path.clone().into_os_string().into_vec(),
                         insert: true,
                     }),
                 );
