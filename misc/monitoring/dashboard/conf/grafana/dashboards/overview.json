@@ -1296,7 +1296,7 @@
       "renderer": "flot",
       "seriesOverrides": [
         {
-          "alias": "mysql.tpcch.customer",
+          "alias": "debezium.tpcch.customer",
           "yaxis": 1
         }
       ],
