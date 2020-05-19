@@ -143,7 +143,6 @@ static void peekThread(const mz::Config* pConfig, const std::atomic<RunState> *p
     promHist.set_value(std::move(hists));
 }
 static void materializeThread(mz::Config config, std::promise<std::vector<Histogram>> promHist,
-<<<<<<< HEAD
                               int peekConns, bool materializeSources, const std::atomic<RunState> *pRunState,
                               useconds_t peekMin, useconds_t peekMax) {
     const auto& connUrl = config.materializedUrl;
