@@ -641,6 +641,8 @@ impl DataPlaneInfo {
 struct ControlPlaneInfo {
     /// Last closed timestamp
     last_closed_ts: u64,
+    /// Time since last capability downgrade
+    time_since_downgrade: Instant,
     /// Per partition (a partition ID in Kafka is an i32), keep track of the last closed offset
     /// and the last closed timestamp
     partition_metadata: HashMap<i32, ConsInfo>,
@@ -657,6 +659,7 @@ impl ControlPlaneInfo {
             partition_metadata: HashMap::new(),
             start_offset,
             source_type: consistency,
+            time_since_downgrade: Instant::now(),
         }
     }
 
@@ -1234,10 +1237,13 @@ fn downgrade_capability(
     } else {
         // This a RT source. It is always possible to close the timestamp and downgrade the
         // capability
-        let ts = cp_info.generate_next_timestamp();
-        if let Some(ts) = ts {
-            dp_info.source_metrics.capability.set(ts);
-            cap.downgrade(&(&ts + 1));
+        if cp_info.time_since_downgrade.elapsed().as_millis() > 100 {
+            let ts = cp_info.generate_next_timestamp();
+            if let Some(ts) = ts {
+                dp_info.source_metrics.capability.set(ts);
+                cap.downgrade(&(&ts + 1));
+            }
+            cp_info.time_since_downgrade = Instant::now();
         }
     }
 }
