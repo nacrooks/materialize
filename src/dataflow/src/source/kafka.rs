@@ -1001,13 +1001,6 @@ where
                                 partition_metrics.messages_ingested.inc();
                             }
 
-                            downgrade_capability(
-                                &id,
-                                cap,
-                                &mut cp_info,
-                                &mut dp_info,
-                                &timestamp_histories,
-                            );
                         }
                     }
 
