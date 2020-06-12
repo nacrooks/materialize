@@ -685,7 +685,7 @@ impl ControlPlaneInfo {
     /// guaranteed to increase monotonically
     fn generate_next_timestamp(&mut self) -> Option<u64> {
         let mut new_ts = 0;
-        while new_ts <= self.last_closed_ts {
+        /*while new_ts <= self.last_closed_ts {
             let start = SystemTime::now();
             new_ts = start
                 .duration_since(UNIX_EPOCH)
@@ -702,8 +702,10 @@ impl ControlPlaneInfo {
             }
         }
         assert!(new_ts > self.last_closed_ts);
-        self.last_closed_ts = new_ts;
-        Some(new_ts)
+        */
+        // self.last_closed_ts = new_ts;
+        self.last_closed_ts += 1;
+        Some(self.last_closed_ts)
     }
 }
 
@@ -782,6 +784,27 @@ fn metadata_fetch(
                 }
                 new_partition_count = metadata_topic.partitions().len();
                 let mut refresh_data = partition_count.lock().expect("lock poisoned");
+
+                // Upgrade partition metrics
+                for p in 0..new_partition_count {
+                    let pid = p.try_into().unwrap();
+                    match consumer.fetch_watermarks(&topic, pid, Duration::from_secs(1)) {
+                        Ok((_, high)) => {
+                            if let Some(max_available_offset) = partition_kafka_metadata.get_mut(&pid) {
+                                max_available_offset.set(high)
+                            } else {
+                                let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[topic,&id, &pid.to_string()]);
+                                max_offset.set(high);
+                                partition_kafka_metadata.insert(pid, max_offset);
+                            }
+                        }
+                        Err(e) => warn!(
+                            "error loading watermarks topic={} partition={} error={}",
+                            topic, p, e
+                        ),
+                    }
+                }
+
                 // Kafka partition are i32, and Kafka consequently cannot support more than i32
                 // partitions
                 *refresh_data = Some(new_partition_count.try_into().unwrap());
@@ -792,25 +815,6 @@ fn metadata_fetch(
             }
         }
 
-        // Upgrade partition metrics
-        for p in 0..new_partition_count {
-            let pid = p.try_into().unwrap();
-            match consumer.fetch_watermarks(&topic, pid, Duration::from_secs(1)) {
-                Ok((_, high)) => {
-                    if let Some(max_available_offset) = partition_kafka_metadata.get_mut(&pid) {
-                        max_available_offset.set(high)
-                    } else {
-                        let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[topic,&id, &pid.to_string()]);
-                        max_offset.set(high);
-                        partition_kafka_metadata.insert(pid, max_offset);
-                    }
-                }
-                Err(e) => warn!(
-                    "error loading watermarks topic={} partition={} error={}",
-                    topic, p, e
-                ),
-            }
-        }
 
         if new_partition_count > 0 {
             thread::sleep(wait);
