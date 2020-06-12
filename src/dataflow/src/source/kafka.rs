@@ -310,7 +310,7 @@ struct DataPlaneInfo {
     /// Per-source metrics.
     source_metrics: SourceMetrics,
     /// Per-partition metrics.
-    partition_metrics: Arc<Mutex<HashMap<i32, PartitionMetrics>>>,
+    partition_metrics: HashMap<i32, PartitionMetrics>,
     /// Worker ID
     worker_id: i32,
     /// Worker Count
@@ -333,7 +333,7 @@ impl DataPlaneInfo {
             .expect("Failed to create Kafka Consumer");
         DataPlaneInfo {
             source_metrics: SourceMetrics::new(&topic_name, &source_id, &worker_id.to_string()),
-            partition_metrics: Arc::new(Mutex::new(HashMap::new())),
+            partition_metrics: HashMap::new(),
             buffered_metadata: HashSet::new(),
             topic_name: topic_name.clone(),
             source_name,
@@ -359,7 +359,7 @@ impl DataPlaneInfo {
         let refresh = self.refresh_metadata_info.clone();
         let id = self.source_id.clone();
         let topic = self.topic_name.clone();
-        let partition_metrics = self.partition_metrics.clone();
+        // let partition_metrics = self.partition_metrics.clone();
         thread::spawn(move || {
             metadata_fetch(
                 timestamping_stopped,
@@ -367,7 +367,7 @@ impl DataPlaneInfo {
                 refresh,
                 &id,
                 &topic,
-                partition_metrics,
+          //      partition_metrics,
                 metadata_refresh_frequency,
             )
         });
@@ -516,8 +516,8 @@ impl DataPlaneInfo {
             self.partition_consumers.len()
         );
         self.partition_metrics
-            .lock()
-            .expect("lock poisoned")
+            //.lock()
+            //.expect("lock poisoned")
             .insert(
                 partition_id,
                 PartitionMetrics::new(&self.topic_name, &self.source_id, &partition_id.to_string()),
@@ -750,7 +750,7 @@ fn metadata_fetch(
     partition_count: Arc<Mutex<Option<i32>>>,
     id: &str,
     topic: &str,
-    partition_metrics: Arc<Mutex<HashMap<i32, PartitionMetrics>>>,
+    //partition_metrics: Arc<Mutex<HashMap<i32, PartitionMetrics>>>,
     wait: Duration,
 ) {
     debug!(
@@ -792,7 +792,7 @@ fn metadata_fetch(
         }
 
         // Upgrade partition metrics
-        for p in 0..new_partition_count {
+        /* for p in 0..new_partition_count {
             let pid = p.try_into().unwrap();
             match consumer.fetch_watermarks(&topic, pid, Duration::from_secs(1)) {
                 Ok((_, high)) => {
@@ -809,7 +809,7 @@ fn metadata_fetch(
                     topic, p, e
                 ),
             }
-        }
+        } */
 
         if new_partition_count > 0 {
             thread::sleep(wait);
@@ -934,12 +934,12 @@ where
                     let offset = MzOffset::from(message.offset);
 
                     // Update ingestion metrics
-                    {
-                        let metrics = &mut dp_info.partition_metrics.lock().expect("lock poisoned");
+                    //{
+                        // let metrics = &mut dp_info.partition_metrics.lock().expect("lock poisoned");
                         // Entry is guaranteed to exist as it gets created when we initialise the partition.
-                        let partition_metrics = metrics.get_mut(&partition).unwrap();
-                        partition_metrics.offset_received.set(offset.offset);
-                    }
+                        // let partition_metrics = metrics.get_mut(&partition).unwrap();
+                        dp_info.partition_metrics.get_mut(&partition).unwrap().offset_received.set(offset.offset);
+                    //
 
                     // Determine the timestamp to which we need to assign this message
                     let ts = find_matching_timestamp(
@@ -988,10 +988,10 @@ where
 
                             // Update ingestion metrics
                             {
-                                let metrics =
-                                    &mut dp_info.partition_metrics.lock().expect("lock poisoned");
+                                // let metrics =
+                                //    &mut dp_info.partition_metrics.lock().expect("lock poisoned");
                                 // Entry is guaranteed to exist as it gets created when we initialise the partition
-                                let partition_metrics = metrics.get_mut(&partition).unwrap();
+                                let partition_metrics = &mut dp_info.partition_metrics.get_mut(&partition).unwrap();
                                 partition_metrics.offset_ingested.set(offset.offset);
                                 partition_metrics.messages_ingested.inc();
                             }
@@ -1191,8 +1191,8 @@ fn downgrade_capability(
 
                     if let Some(pmetrics) = dp_info
                         .partition_metrics
-                        .lock()
-                        .expect("lock poisoned")
+                        //.lock()
+                        //.expect("lock poisoned")
                         .get_mut(&pid)
                     {
                         pmetrics
