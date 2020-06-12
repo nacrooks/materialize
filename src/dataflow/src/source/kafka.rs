@@ -83,7 +83,6 @@ impl SourceMetrics {
 pub struct PartitionMetrics {
     offset_ingested: IntGauge,
     offset_received: IntGauge,
-    max_offset: IntGauge,
     closed_ts: UIntGauge,
     messages_ingested: IntCounter,
 }
@@ -116,18 +115,12 @@ impl PartitionMetrics {
                 &["topic", "source_id", "partition_id"]
             )
             .unwrap();
-            static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
-                "mz_kafka_partition_offset_max",
-                "The high watermark for a partition, the maximum offset that we could hope to ingest",
-                &["topic", "source_id", "partition_id"]
-            )
-            .unwrap();
+
         }
         let labels = &[topic_name, source_id, partition_id];
         PartitionMetrics {
             offset_ingested: OFFSET_INGESTED.with_label_values(labels),
             offset_received: OFFSET_RECEIVED.with_label_values(labels),
-            max_offset: MAX_AVAILABLE_OFFSET.with_label_values(labels),
             closed_ts: CLOSED_TS.with_label_values(labels),
             messages_ingested: MESSAGES_INGESTED.with_label_values(labels),
         }
@@ -367,7 +360,6 @@ impl DataPlaneInfo {
                 refresh,
                 &id,
                 &topic,
-          //      partition_metrics,
                 metadata_refresh_frequency,
             )
         });
@@ -750,13 +742,22 @@ fn metadata_fetch(
     partition_count: Arc<Mutex<Option<i32>>>,
     id: &str,
     topic: &str,
-    //partition_metrics: Arc<Mutex<HashMap<i32, PartitionMetrics>>>,
     wait: Duration,
 ) {
     debug!(
         "Starting realtime Kafka thread for {} (source {})",
         &topic, id
     );
+
+    lazy_static! {
+    static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
+                "mz_kafka_partition_offset_max",
+                "The high watermark for a partition, the maximum offset that we could hope to ingest",
+                &["topic", "source_id", "partition_id"]
+            ).unwrap();
+    }
+
+    let mut partition_kafka_metadata: HashMap<i32, IntGauge> = HashMap::new();
 
     while !timestamping_stopped.load(Ordering::SeqCst) {
         let metadata = consumer.fetch_metadata(Some(&topic), Duration::from_secs(30));
@@ -792,16 +793,16 @@ fn metadata_fetch(
         }
 
         // Upgrade partition metrics
-        /* for p in 0..new_partition_count {
+        for p in 0..new_partition_count {
             let pid = p.try_into().unwrap();
             match consumer.fetch_watermarks(&topic, pid, Duration::from_secs(1)) {
                 Ok((_, high)) => {
-                    if let Some(metrics) = partition_metrics
-                        .lock()
-                        .expect("lock poisoned")
-                        .get_mut(&pid)
-                    {
-                        metrics.max_offset.set(high);
+                    if let Some(max_available_offset) = partition_kafka_metadata.get_mut(&pid) {
+                        max_available_offset.set(high)
+                    } else {
+                        let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[topic,&id, &pid.to_string()]);
+                        max_offset.set(high);
+                        partition_kafka_metadata.insert(pid, max_offset);
                     }
                 }
                 Err(e) => warn!(
@@ -809,7 +810,7 @@ fn metadata_fetch(
                     topic, p, e
                 ),
             }
-        } */
+        }
 
         if new_partition_count > 0 {
             thread::sleep(wait);
