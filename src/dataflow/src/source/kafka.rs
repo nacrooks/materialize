@@ -644,7 +644,7 @@ struct ControlPlaneInfo {
     /// Time since last capability downgrade
     time_since_downgrade: Instant,
     /// Frequency at which we should downgrade capability (in milliseconds)
-    downgrade_capability_frequency: u128,
+    downgrade_capability_frequency: u64,
     /// Per partition (a partition ID in Kafka is an i32), keep track of the last closed offset
     /// and the last closed timestamp
     partition_metadata: HashMap<i32, ConsInfo>,
@@ -662,7 +662,8 @@ impl ControlPlaneInfo {
     ) -> ControlPlaneInfo {
         ControlPlaneInfo {
             last_closed_ts: 0,
-            downgrade_capability_frequency: timestamp_frequency.as_millis(),
+            // Safe conversion: statement.rs checks that value specified fits in u64
+            downgrade_capability_frequency: timestamp_frequency.as_millis().try_into().unwrap(),
             partition_metadata: HashMap::new(),
             start_offset,
             source_type: consistency,
@@ -695,7 +696,7 @@ impl ControlPlaneInfo {
     /// guaranteed to increase monotonically
     fn generate_next_timestamp(&mut self) -> Option<u64> {
         let mut new_ts = 0;
-        /*while new_ts <= self.last_closed_ts {
+        while new_ts <= self.last_closed_ts {
             let start = SystemTime::now();
             new_ts = start
                 .duration_since(UNIX_EPOCH)
@@ -712,9 +713,7 @@ impl ControlPlaneInfo {
             }
         }
         assert!(new_ts > self.last_closed_ts);
-        */
-        // self.last_closed_ts = new_ts;
-        self.last_closed_ts += 1;
+        self.last_closed_ts = new_ts;
         Some(self.last_closed_ts)
     }
 }
@@ -1058,8 +1057,9 @@ where
 
                 // Ensure that we activate the source frequently enough to keep downgrading
                 // capabilities, even when no data has arrived
-                // TODO(ncrooks): make this configurable
-                activator.activate_after(Duration::from_secs(1));
+                activator.activate_after(Duration::from_millis(
+                    cp_info.downgrade_capability_frequency,
+                ));
                 SourceStatus::Alive
             }
         },
@@ -1259,7 +1259,7 @@ fn downgrade_capability(
         // This a RT source. It is always possible to close the timestamp and downgrade the
         // capability
         if cp_info.time_since_downgrade.elapsed().as_millis()
-            > cp_info.downgrade_capability_frequency
+            > cp_info.downgrade_capability_frequency.try_into().unwrap()
         {
             let ts = cp_info.generate_next_timestamp();
             if let Some(ts) = ts {
