@@ -643,6 +643,8 @@ struct ControlPlaneInfo {
     last_closed_ts: u64,
     /// Time since last capability downgrade
     time_since_downgrade: Instant,
+    /// Frequency at which we should downgrade capability (in milliseconds)
+    downgrade_capability_frequency: u128,
     /// Per partition (a partition ID in Kafka is an i32), keep track of the last closed offset
     /// and the last closed timestamp
     partition_metadata: HashMap<i32, ConsInfo>,
@@ -653,9 +655,14 @@ struct ControlPlaneInfo {
 }
 
 impl ControlPlaneInfo {
-    fn new(start_offset: MzOffset, consistency: Consistency) -> ControlPlaneInfo {
+    fn new(
+        start_offset: MzOffset,
+        consistency: Consistency,
+        timestamp_frequency: Duration,
+    ) -> ControlPlaneInfo {
         ControlPlaneInfo {
             last_closed_ts: 0,
+            downgrade_capability_frequency: timestamp_frequency.as_millis(),
             partition_metadata: HashMap::new(),
             start_offset,
             source_type: consistency,
@@ -755,11 +762,12 @@ fn metadata_fetch(
     );
 
     lazy_static! {
-    static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
-                "mz_kafka_partition_offset_max",
-                "The high watermark for a partition, the maximum offset that we could hope to ingest",
-                &["topic", "source_id", "partition_id"]
-            ).unwrap();
+        static ref MAX_AVAILABLE_OFFSET: IntGaugeVec = register_int_gauge_vec!(
+            "mz_kafka_partition_offset_max",
+            "The high watermark for a partition, the maximum offset that we could hope to ingest",
+            &["topic", "source_id", "partition_id"]
+        )
+        .unwrap();
     }
 
     let mut partition_kafka_metadata: HashMap<i32, IntGauge> = HashMap::new();
@@ -793,10 +801,16 @@ fn metadata_fetch(
                     let pid = p.try_into().unwrap();
                     match consumer.fetch_watermarks(&topic, pid, Duration::from_secs(1)) {
                         Ok((_, high)) => {
-                            if let Some(max_available_offset) = partition_kafka_metadata.get_mut(&pid) {
+                            if let Some(max_available_offset) =
+                                partition_kafka_metadata.get_mut(&pid)
+                            {
                                 max_available_offset.set(high)
                             } else {
-                                let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[topic,&id, &pid.to_string()]);
+                                let max_offset = MAX_AVAILABLE_OFFSET.with_label_values(&[
+                                    topic,
+                                    &id,
+                                    &pid.to_string(),
+                                ]);
                                 max_offset.set(high);
                                 partition_kafka_metadata.insert(pid, max_offset);
                             }
@@ -817,7 +831,6 @@ fn metadata_fetch(
                 error!("Failed to obtain Kafka Metadata Information {}", e);
             }
         }
-
 
         if new_partition_count > 0 {
             thread::sleep(wait);
@@ -852,6 +865,7 @@ where
 
     let timestamp_channel = activate_source_timestamping(&config, connector);
     let timestamping_stopped = Arc::new(AtomicBool::new(false));
+
     let SourceConfig {
         name,
         id,
@@ -860,6 +874,7 @@ where
         worker_id,
         worker_count,
         consistency,
+        timestamp_frequency,
         ..
     } = config;
 
@@ -879,6 +894,7 @@ where
                     offset: start_offset,
                 },
                 consistency.clone(),
+                timestamp_frequency,
             );
 
             // Create dataplane information (Kafka-related information)
@@ -943,10 +959,15 @@ where
 
                     // Update ingestion metrics
                     //{
-                        // let metrics = &mut dp_info.partition_metrics.lock().expect("lock poisoned");
-                        // Entry is guaranteed to exist as it gets created when we initialise the partition.
-                        // let partition_metrics = metrics.get_mut(&partition).unwrap();
-                        dp_info.partition_metrics.get_mut(&partition).unwrap().offset_received.set(offset.offset);
+                    // let metrics = &mut dp_info.partition_metrics.lock().expect("lock poisoned");
+                    // Entry is guaranteed to exist as it gets created when we initialise the partition.
+                    // let partition_metrics = metrics.get_mut(&partition).unwrap();
+                    dp_info
+                        .partition_metrics
+                        .get_mut(&partition)
+                        .unwrap()
+                        .offset_received
+                        .set(offset.offset);
                     //
 
                     // Determine the timestamp to which we need to assign this message
@@ -999,11 +1020,11 @@ where
                                 // let metrics =
                                 //    &mut dp_info.partition_metrics.lock().expect("lock poisoned");
                                 // Entry is guaranteed to exist as it gets created when we initialise the partition
-                                let partition_metrics = &mut dp_info.partition_metrics.get_mut(&partition).unwrap();
+                                let partition_metrics =
+                                    &mut dp_info.partition_metrics.get_mut(&partition).unwrap();
                                 partition_metrics.offset_ingested.set(offset.offset);
                                 partition_metrics.messages_ingested.inc();
                             }
-
                         }
                     }
 
@@ -1237,7 +1258,9 @@ fn downgrade_capability(
     } else {
         // This a RT source. It is always possible to close the timestamp and downgrade the
         // capability
-        if cp_info.time_since_downgrade.elapsed().as_millis() > 100 {
+        if cp_info.time_since_downgrade.elapsed().as_millis()
+            > cp_info.downgrade_capability_frequency
+        {
             let ts = cp_info.generate_next_timestamp();
             if let Some(ts) = ts {
                 dp_info.source_metrics.capability.set(ts);
