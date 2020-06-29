@@ -31,7 +31,7 @@ use super::SourceOutput;
 use crate::operator::StreamExt;
 use crate::server::{TimestampDataUpdate, TimestampDataUpdates, TimestampMetadataUpdate};
 use crate::source::util::source;
-use crate::source::{SourceConfig, SourceStatus, SourceToken};
+use crate::source::{SourceConfig, SourceStatus, SourceToken, SourceData};
 
 /// Strategies for streaming content from a file.
 #[derive(PartialEq, Eq)]
@@ -336,24 +336,23 @@ fn find_matching_timestamp(
 }
 
 /// Create a file-based timely dataflow source operator.
-pub fn file<G, Ctor, I, Out, Err>(
+pub fn file<G, Ctor, I, Err>(
     config: SourceConfig<G>,
     path: PathBuf,
     read_style: FileReadStyle,
     iter_ctor: Ctor,
 ) -> (
     (
-        timely::dataflow::Stream<G, SourceOutput<Vec<u8>, Out>>,
+        timely::dataflow::Stream<G, SourceOutput<Vec<u8>, SourceData>>,
         timely::dataflow::Stream<G, SourceError>,
     ),
     Option<SourceToken>,
 )
 where
     G: Scope<Timestamp = Timestamp>,
-    I: IntoIterator<Item = Result<Out, Err>> + Send + 'static,
+    I: IntoIterator<Item = Result<SourceData, Err>> + Send + 'static,
     Ctor: FnOnce(Box<dyn Read + Send>) -> Result<I, Err> + Send + 'static,
     Err: Into<failure::Error> + Send + 'static,
-    Out: Send + Clone + 'static,
 {
     const HEARTBEAT: Duration = Duration::from_secs(1); // Update the capability every second if there are no new changes.
     const MAX_RECORDS_PER_INVOCATION: usize = 1024;
